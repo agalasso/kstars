@@ -15,6 +15,7 @@
 
 #include "ekos/ekosmanager.h"
 
+#include <cassert>
 #include <fitsio.h>
 #include <KMessageBox>
 #include <QImage>
@@ -186,35 +187,20 @@ void PHD2::displayError(QAbstractSocket::SocketError socketError)
 
 void PHD2::readPHD2()
 {
-    QTextStream stream(tcpSocket);
-
-    QJsonParseError qjsonError;
-
-    while (stream.atEnd() == false)
+    while (!tcpSocket->atEnd() && tcpSocket->canReadLine())
     {
-        QString rawString = stream.readLine();
-
-        if (rawString.isEmpty())
+        QByteArray line = tcpSocket->readLine();
+        if (line.isEmpty())
             continue;
 
-        QJsonDocument jdoc = QJsonDocument::fromJson(rawString.toLatin1(), &qjsonError);
+        QJsonParseError qjsonError;
+
+        QJsonDocument jdoc = QJsonDocument::fromJson(line, &qjsonError);
 
         if (qjsonError.error != QJsonParseError::NoError)
         {
-            //This will remove a method that had parsing errors from the request list.
-            removeBrokenRequestFromList(rawString);
-
-            //So we don't spam the error log with image frames that accidentally get broken up.
-            if(rawString.contains("frame"))     //This prevents it from printing the first line of the error.
-                blockLine2=true;                //This will set it to watch for the second line to cause an error.
-            else if(blockLine2)                 //This will prevent it from printing the second line of the error.
-                blockLine2=false;               //After avoiding printing the error message, this will set it to look for errors again.
-            else
-            {
-                //This will still print other parsing errors that don't involve image frames.
-                emit newLog(rawString);
-                emit newLog(qjsonError.errorString());
-            }
+            emit newLog(i18n("PHD2: invalid response received: %1", QString(line)));
+            emit newLog(i18n("PHD2: JSON error: %1", qjsonError.errorString()));
             continue;
         }
 
@@ -225,7 +211,7 @@ void PHD2::readPHD2()
         else if (jsonObj.contains("error"))
             processPHD2Error(jsonObj);
         else if (jsonObj.contains("result"))
-            processPHD2Result(jsonObj, rawString);
+            processPHD2Result(jsonObj, line);
     }
 }
 
@@ -491,14 +477,14 @@ void PHD2::processPHD2State(const QString &phd2State)
         state = LOOPING;
 }
 
-void PHD2::processPHD2Result(const QJsonObject &jsonObj, QString rawString)
+void PHD2::processPHD2Result(const QJsonObject &jsonObj, const QByteArray& rawResult)
 {
-    PHD2ResultType resultRequest = takeRequestFromList(jsonObj);
+    PHD2ResultType resultType = takeRequestFromList(jsonObj);
 
-    if(resultRequest != STAR_IMAGE)  //This is so we don't spam the log with Image Data.
-        qCDebug(KSTARS_EKOS_GUIDE) << rawString;
+    if (resultType != STAR_IMAGE)  // don't spam the log with image data
+        qCDebug(KSTARS_EKOS_GUIDE) << rawResult;
 
-    switch (resultRequest)
+    switch (resultType)
     {
         case NO_RESULT:
             //Ekos didn't ask for this result?
@@ -638,44 +624,36 @@ void PHD2::processPHD2Error(const QJsonObject &jsonError)
 
     emit newLog(i18n("PHD2 Error: %1", jsonErrorObject["message"].toString()));
 
-    if(jsonError.contains("id"))
+    PHD2ResultType resultType = takeRequestFromList(jsonError);
+
+    // This means the user mistakenly entered an invalid exposure time.
+    if (resultType == SET_EXPOSURE_COMMAND_RECEIVED)
     {
+        emit newLog(logValidExposureTimes);  //This will let the user know the valid exposure durations
+        QTimer::singleShot(300, [=]{requestExposureTime();}); //This will reset the Exposure time in Ekos to PHD2's current exposure time after a third of a second.
+    }
+    else if (resultType == CONNECTION_RESULT)
+    {
+        connection = EQUIPMENT_DISCONNECTED;
+        emit newStatus(Ekos::GUIDE_DISCONNECTED);
+    }
+    else if (resultType == DITHER_COMMAND_RECEIVED && state == DITHERING)
+    {
+        ditherTimer->stop();
+        state = DITHER_FAILED;
+        emit newStatus(GUIDE_DITHERING_ERROR);
 
-        PHD2ResultType resultRequest = takeRequestFromList(jsonError);
-
-        //There are just a couple of requests that currently need further handling when they error, so a switch statement is not needed.
-
-        //This means the user mistakenly entered an invalid exposure time.
-        if(resultRequest == SET_EXPOSURE_COMMAND_RECEIVED)
+        if (Options::ditherFailAbortsAutoGuide())
         {
-            emit newLog(logValidExposureTimes);  //This will let the user know the valid exposure durations
-            QTimer::singleShot(300, [=]{requestExposureTime();}); //This will reset the Exposure time in Ekos to PHD2's current exposure time after a third of a second.
+            state = STOPPED;
+            emit newStatus(GUIDE_ABORTED);
         }
-        else if(resultRequest == CONNECTION_RESULT)
+        else
         {
-            connection = EQUIPMENT_DISCONNECTED;
-            emit newStatus(Ekos::GUIDE_DISCONNECTED);
+            resume();
         }
-        else if(resultRequest == DITHER_COMMAND_RECEIVED && state == DITHERING)
-        {
-            ditherTimer->stop();
-            state = DITHER_FAILED;
-            emit newStatus(GUIDE_DITHERING_ERROR);
-
-            if (Options::ditherFailAbortsAutoGuide())
-            {
-                state = STOPPED;
-                emit newStatus(GUIDE_ABORTED);
-            }
-            else
-            {
-                resume();
-            }
-         }
     }
 }
-
-
 
 //These methods process the Star Images the PHD2 provides
 
@@ -1075,8 +1053,10 @@ bool PHD2::calibrate()
 
 //This is how information requests and commands for PHD2 are handled
 
-void PHD2::sendPHD2Request(const QString &method, const QJsonArray args)
+void PHD2::sendPHD2Request(const QString &method, const QJsonArray &args)
 {
+    assert(methodResults.contains(method));
+
     QJsonObject jsonRPC;
 
     jsonRPC.insert("jsonrpc", "2.0");
@@ -1085,8 +1065,9 @@ void PHD2::sendPHD2Request(const QString &method, const QJsonArray args)
     if (args.empty() == false)
         jsonRPC.insert("params", args);
 
-    resultRequests.append(qMakePair(methodID,method));
-    jsonRPC.insert("id", methodID++);
+    int rpcId = nextRpcId++;
+    resultRequests.append(qMakePair(rpcId, methodResults.value(method)));
+    jsonRPC.insert("id", rpcId);
 
     QJsonDocument json_doc(jsonRPC);
 
@@ -1097,38 +1078,35 @@ void PHD2::sendPHD2Request(const QString &method, const QJsonArray args)
     tcpSocket->write("\r\n");
 }
 
-PHD2::PHD2ResultType PHD2::takeRequestFromList(const QJsonObject &jsonObj)
+// Compare two rpc ids returning true if id1 is older than id2, false
+// otherwise, properly handling wrap-around of signed integers
+inline static bool RpcIdIsOlder(int id1, int id2)
 {
-    PHD2ResultType resultRequest = NO_RESULT;
-    int id = jsonObj["id"].toInt();
-
-    for(int i = 0; i < resultRequests.size(); i++){
-        QPair<int, QString> request = resultRequests.at(i);
-        if(request.first == id){
-            resultRequest = methodResults.value(request.second);
-            resultRequests.remove(i);
-            break;
-        }
-    }
-    return resultRequest;
+    return (int) ((unsigned int) id1 - (unsigned int) id2) < 0;
 }
 
-void PHD2::removeBrokenRequestFromList(QString rawString)
+PHD2::PHD2ResultType PHD2::takeRequestFromList(const QJsonObject &response)
 {
-    if(rawString.contains("\"id\":"))
+    if (!response.contains("id"))
+        return NO_RESULT;
+
+    int id = response["id"].toInt();
+
+    // phd2's responses are guaranteed to come in order so entries
+    // with older ids are stale and can be removed
+
+    while (!resultRequests.isEmpty() && RpcIdIsOlder(resultRequests.at(0).first, id))
     {
-        int idLocation   = rawString.indexOf("\"id\":") + 5;
-        int endOfID = rawString.indexOf("}" , idLocation) - idLocation;
-        QString idString = rawString.mid(idLocation, endOfID);
-        int id = idString.toInt();
-        for(int i = 0; i < resultRequests.size(); i++){
-            QPair<int, QString> request = resultRequests.at(i);
-            if(request.first == id){
-                resultRequests.remove(i);
-                break;
-            }
-        }
+        qCDebug(KSTARS_EKOS_GUIDE) << "PHD2: removing stale rpc id " << resultRequests.at(0).first;
+        resultRequests.remove(0);
     }
+
+    if (resultRequests.isEmpty() || resultRequests.at(0).first != id)
+        return NO_RESULT;
+
+    PHD2::PHD2ResultType val = resultRequests.at(0).second;
+    resultRequests.remove(0);
+    return val;
 }
 
 }

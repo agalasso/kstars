@@ -199,28 +199,27 @@ class PHD2 : public GuideInterface
 
     QVector<QPointF> errorLog;
 
-    void sendPHD2Request(const QString &method, const QJsonArray args = QJsonArray());
-    void sendJSONRPCRequest(const QString &method, const QJsonArray args = QJsonArray());
-    bool blockLine2=false;
+    void sendPHD2Request(const QString &method, const QJsonArray &args = QJsonArray());
+    void sendJSONRPCRequest(const QString &method, const QJsonArray &args = QJsonArray());
 
     void processPHD2Event(const QJsonObject &jsonEvent);
-    void processPHD2Result(const QJsonObject &jsonObj, QString rawString);
+    void processPHD2Result(const QJsonObject &jsonObj, const QByteArray &rawResult);
     void processStarImage(const QJsonObject &jsonStarFrame);
     void processPHD2State(const QString &phd2State);
     void processPHD2Error(const QJsonObject &jsonError);
 
-    QTcpSocket *tcpSocket { nullptr };
-    qint64 methodID { 1 };
+    PHD2ResultType takeRequestFromList(const QJsonObject &response);
 
-    QHash<QString, PHD2Event> events;
-    QHash<QString, PHD2ResultType> methodResults;
-    QVector<QPair<int, QString>> resultRequests;
+    QTcpSocket *tcpSocket { nullptr };
+    int nextRpcId { 1 };
+
+    QHash<QString, PHD2Event> events;                     // maps event name to event type
+    QHash<QString, PHD2ResultType> methodResults;         // maps method name to result type
+    QVector<QPair<int, PHD2ResultType>> resultRequests;   // result type for each RPC id
 
     PHD2State state { STOPPED };
     PHD2Connection connection { DISCONNECTED };
     PHD2Event event { Alert };
-    PHD2ResultType takeRequestFromList(const QJsonObject &jsonObj);
-    void removeBrokenRequestFromList(QString rawString);
     uint8_t setConnectedRetries { 0 };
 
     void setEquipmentConnected();
