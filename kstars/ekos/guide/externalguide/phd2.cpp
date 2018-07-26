@@ -668,8 +668,13 @@ void PHD2::processStarImage(const QJsonObject &jsonStarFrame)
    int width =  jsonStarFrame["width"].toInt();
    int height = jsonStarFrame["height"].toInt();
 
-   //This sets up the Temp file which will be reused for subsequent captures
-   QString filename = KSPaths::writableLocation(QStandardPaths::TempLocation) + QLatin1Literal("phd2.fits");
+   QTemporaryFile tempfile(KSPaths::writableLocation(QStandardPaths::TempLocation) + QLatin1Literal("phd2_XXXXXX"));
+   if (!tempfile.open())
+   {
+       qCWarning(KSTARS_EKOS_GUIDE) << "could not create temp file for PHD2 star image";
+       return;
+   }
+   QString filename = tempfile.fileName();
 
    //This section sets up the FITS File
    fitsfile *fptr = nullptr;
@@ -687,6 +692,8 @@ void PHD2::processStarImage(const QJsonObject &jsonStarFrame)
    if (fits_create_img(fptr, USHORT_IMG, naxis, naxes, &status))
    {
        qCWarning(KSTARS_EKOS_GUIDE) << "fits_create_img failed:" << error_status;
+       status = 0;
+       fits_close_file(fptr, &status);
        return;
    }
 
@@ -705,6 +712,8 @@ void PHD2::processStarImage(const QJsonObject &jsonStarFrame)
    {
        fits_get_errstatus(status, error_status);
        qCWarning(KSTARS_EKOS_GUIDE) << "fits_write_img failed:" << error_status;
+       status = 0;
+       fits_close_file(fptr, &status);
        return;
    }
 
@@ -712,6 +721,8 @@ void PHD2::processStarImage(const QJsonObject &jsonStarFrame)
    {
        fits_get_errstatus(status, error_status);
        qCWarning(KSTARS_EKOS_GUIDE) << "fits_flush_file failed:" << error_status;
+       status = 0;
+       fits_close_file(fptr, &status);
        return;
    }
 
