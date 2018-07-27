@@ -14,6 +14,7 @@
 #include "kstars.h"
 
 #include "ekos/ekosmanager.h"
+#include "fitsviewer/fitsdata.h"
 
 #include <cassert>
 #include <fitsio.h>
@@ -21,7 +22,6 @@
 #include <QImage>
 
 #include <QJsonDocument>
-#include <QJsonObject>
 #include <QtNetwork/QNetworkReply>
 
 #include <ekos_guide_debug.h>
@@ -118,16 +118,18 @@ PHD2::PHD2()
     ditherTimer = new QTimer(this);
     connect(ditherTimer, &QTimer::timeout, this, [=]
     {
+        qCDebug(KSTARS_EKOS_GUIDE) << "ditherTimer expired, state" << state << "dithering" << isDitherActive << "settling" << isSettling;
         ditherTimer->stop();
+        isDitherActive = false;
+        isSettling = false;
         if (Options::ditherFailAbortsAutoGuide())
         {
-            state = DITHER_FAILED;
+            abort();
             emit newStatus(GUIDE_DITHERING_ERROR);
         }
         else
         {
             emit newLog(i18n("PHD2: There was no dithering response from PHD2, but continue guiding."));
-            state = GUIDING;
             emit newStatus(Ekos::GUIDE_DITHERING_SUCCESS);
         }
     });
@@ -136,6 +138,7 @@ PHD2::PHD2()
 PHD2::~PHD2()
 {
     delete abortTimer;
+    delete ditherTimer;
 }
 
 bool PHD2::Connect()
@@ -150,12 +153,41 @@ bool PHD2::Connect()
     return true;
 }
 
+void PHD2::ResetConnectionState()
+{
+    connection = DISCONNECTED;
+
+    // clear the outstanding and queued RPC requests
+    pendingRpcResultType = NO_RESULT;
+    rpcRequestQueue.clear();
+
+    isSettling = false;
+    isDitherActive = false;
+
+    ditherTimer->stop();
+    abortTimer->stop();
+}
+
 bool PHD2::Disconnect()
 {
     if (connection == EQUIPMENT_CONNECTED)
-        connectEquipment(false);
+    {
+        // !FIXME-ag this is not reliable because we are just sending
+        // a blind request to disconnect equipment then close the
+        // socket. PHD2 will refuse to disconnect the equipment if it
+        // is still looping exposures
+        //
+        // to be reliable it should:
+        //    call stop_capture
+        //    wait for the stop to complete by polling get_app_state
+        //    disconnect equipment
+        //    disconnect from phd2
 
-    connection = DISCONNECTED;
+        connectEquipment(false);
+    }
+
+    ResetConnectionState();
+
     tcpSocket->disconnectFromHost();
 
     emit newStatus(GUIDE_DISCONNECTED);
@@ -182,7 +214,7 @@ void PHD2::displayError(QAbstractSocket::SocketError socketError)
             emit newLog(i18n("The following error occurred: %1.", tcpSocket->errorString()));
     }
 
-    connection = DISCONNECTED;
+    ResetConnectionState();
 }
 
 void PHD2::readPHD2()
@@ -207,19 +239,21 @@ void PHD2::readPHD2()
         QJsonObject jsonObj = jdoc.object();
 
         if (jsonObj.contains("Event"))
-            processPHD2Event(jsonObj);
+            processPHD2Event(jsonObj, line);
         else if (jsonObj.contains("error"))
-            processPHD2Error(jsonObj);
+            processPHD2Error(jsonObj, line);
         else if (jsonObj.contains("result"))
             processPHD2Result(jsonObj, line);
     }
 }
 
-void PHD2::processPHD2Event(const QJsonObject &jsonEvent)
+void PHD2::processPHD2Event(const QJsonObject &jsonEvent, const QByteArray &line)
 {
+    qCDebug(KSTARS_EKOS_GUIDE) << "PHD2: event:" << line;
+
     QString eventName = jsonEvent["Event"].toString();
 
-    if (events.contains(eventName) == false)
+    if (!events.contains(eventName))
     {
         emit newLog(i18n("Unknown PHD2 event: %1", eventName));
         return;
@@ -232,23 +266,15 @@ void PHD2::processPHD2Event(const QJsonObject &jsonEvent)
         case Version:
             emit newLog(i18n("PHD2: Version %1", jsonEvent["PHDVersion"].toString()));
             connection = CONNECTED;
-            //This will give the other initial messages from PHD2 a chance to come in first.
-            //And then if the equipment is not already connected, then try to connect it.
-            QTimer::singleShot(100, [=]{
-                if(connection != EQUIPMENT_CONNECTED)
-                    connectEquipment(true);
-            });
             break;
 
         case CalibrationComplete:
-            state = GUIDING;
             setEquipmentConnected();
             emit newLog(i18n("PHD2: Calibration Complete."));
             emit newStatus(Ekos::GUIDE_CALIBRATION_SUCESS);
             break;
 
         case StartGuiding:
-            state = GUIDING;
             setEquipmentConnected();
             updateGuideParameters();
             emit newLog(i18n("PHD2: Guiding Started."));
@@ -268,11 +294,14 @@ void PHD2::processPHD2Event(const QJsonObject &jsonEvent)
             break;
 
         case AppState:
+            // AppState is the last of the initial messages received when we first connect to PHD2
             processPHD2State(jsonEvent["State"].toString());
+            // if the equipment is not already connected, then try to connect it.
+            if (connection != EQUIPMENT_CONNECTED)
+                connectEquipment(true);
             break;
 
         case CalibrationFailed:
-            state = CALIBRATION_FAILED;
             emit newLog(i18n("PHD2: Calibration Failed (%1).", jsonEvent["Reason"].toString()));
             emit newStatus(Ekos::GUIDE_CALIBRATION_ERROR);
             break;
@@ -282,10 +311,12 @@ void PHD2::processPHD2Event(const QJsonObject &jsonEvent)
             break;
 
         case LoopingExposures:
+            state = LOOPING;
             //emit newLog(i18n("PHD2: Looping Exposures."));
             break;
 
         case LoopingExposuresStopped:
+            state = STOPPED;
             emit newLog(i18n("PHD2: Looping Exposures Stopped."));
             break;
 
@@ -304,27 +335,34 @@ void PHD2::processPHD2Event(const QJsonObject &jsonEvent)
                 emit newLog(i18n("PHD2: Settling failed (%1).", jsonEvent["Error"].toString()));
             }
 
-            if (state == GUIDING)
-            {
-                if (error)
-                    state = STOPPED;
-                else
-                    emit newLog(i18n("PHD2: Settling complete, Guiding Started."));
-            }
-            else if (state == DITHERING)
+            bool wasDithering = isDitherActive;
+
+            isDitherActive = false;
+            isSettling = false;
+
+            if (wasDithering)
             {
                 ditherTimer->stop();
                 if (error && Options::ditherFailAbortsAutoGuide())
                 {
-                    state = DITHER_FAILED;
+                    abort();
                     emit newStatus(GUIDE_DITHERING_ERROR);
                 }
                 else
                 {
-                    if(error)
-                         emit newLog(i18n("PHD2: There was a dithering error, but continue guiding."));
-                    state = GUIDING;
+                    if (error)
+                        emit newLog(i18n("PHD2: There was a dithering error, but continue guiding."));
+
                     emit newStatus(Ekos::GUIDE_DITHERING_SUCCESS);
+                }
+            }
+            else
+            {
+                // settle completed after "guide" command
+
+                if (!error)
+                {
+                    emit newLog(i18n("PHD2: Settling complete, Guiding Started."));
                 }
             }
         }
@@ -336,7 +374,7 @@ void PHD2::processPHD2Event(const QJsonObject &jsonEvent)
 
         case StarLost:
             emit newLog(i18n("PHD2: Star Lost. Trying to reacquire."));
-            if(state != LOSTLOCK)
+            if (state != LOSTLOCK)
             {
                 state = LOSTLOCK;
                 abortTimer->start(starReAcquisitionTime);
@@ -344,33 +382,32 @@ void PHD2::processPHD2Event(const QJsonObject &jsonEvent)
             break;
 
         case GuidingStopped:
-            emit newLog(i18n("PHD2: Guiding Stopped."));
             state = STOPPED;
+            emit newLog(i18n("PHD2: Guiding Stopped."));
             emit newStatus(Ekos::GUIDE_IDLE);
             break;
 
         case Resumed:
             emit newLog(i18n("PHD2: Guiding Resumed."));
             emit newStatus(Ekos::GUIDE_GUIDING);
-            state = GUIDING;
             break;
 
         case GuideStep:
         {
-            if(state == DITHERING)
-                    return;
-            if( state == LOSTLOCK)
+            if (state == LOSTLOCK)
             {
                 emit newLog(i18n("PHD2: Star found, guiding resumed."));
                 abortTimer->stop();  
                 state = GUIDING;
             }
-            else if(state != GUIDING)
+            else if (state != GUIDING)
             {
                 emit newLog(i18n("PHD2: Guiding started up again."));
                 emit newStatus(Ekos::GUIDE_GUIDING);
                 state = GUIDING;
             }
+            if (isDitherActive)
+                return;
             double diff_ra_pixels, diff_de_pixels, diff_ra_arcsecs, diff_de_arcsecs, pulse_ra, pulse_dec;
             QString RADirection, DECDirection;
             diff_ra_pixels = jsonEvent["RADistanceRaw"].toDouble();
@@ -380,13 +417,13 @@ void PHD2::processPHD2Event(const QJsonObject &jsonEvent)
             RADirection = jsonEvent["RADirection"].toString();
             DECDirection = jsonEvent["DECDirection"].toString();
 
-            if(RADirection == "East")
+            if (RADirection == "East")
                 pulse_ra = -pulse_ra;  //West Direction is Positive, East is Negative
-            if(DECDirection == "South")
+            if (DECDirection == "South")
                 pulse_dec = -pulse_dec; //South Direction is Negative, North is Positive
 
             //If the pixelScale is properly set from PHD2, the second block of code is not needed, but if not, we will attempt to calculate the ra and dec error without it.
-            if(pixelScale!=0)
+            if (pixelScale != 0)
             {
                 diff_ra_arcsecs = diff_ra_pixels * pixelScale;
                 diff_de_arcsecs = diff_de_pixels * pixelScale;
@@ -424,11 +461,6 @@ void PHD2::processPHD2Event(const QJsonObject &jsonEvent)
         break;
 
         case GuidingDithered:
-            if(state == GUIDING)
-            {
-                state = DITHERING;
-                emit newStatus(Ekos::GUIDE_DITHERING);
-            }
             break;
 
         case LockPositionSet:
@@ -467,7 +499,7 @@ void PHD2::processPHD2State(const QString &phd2State)
         state = SELECTED;
     else if (phd2State == "Calibrating")
         state = CALIBRATING;
-    else if (phd2State == "GUIDING")
+    else if (phd2State == "Guiding")
         state = GUIDING;
     else if (phd2State == "LostLock")
         state = LOSTLOCK;
@@ -477,12 +509,14 @@ void PHD2::processPHD2State(const QString &phd2State)
         state = LOOPING;
 }
 
-void PHD2::processPHD2Result(const QJsonObject &jsonObj, const QByteArray& rawResult)
+void PHD2::processPHD2Result(const QJsonObject &jsonObj, const QByteArray &line)
 {
     PHD2ResultType resultType = takeRequestFromList(jsonObj);
 
-    if (resultType != STAR_IMAGE)  // don't spam the log with image data
-        qCDebug(KSTARS_EKOS_GUIDE) << rawResult;
+    if (resultType == STAR_IMAGE)
+        qCDebug(KSTARS_EKOS_GUIDE) << "PHD2: received star image response, id" << jsonObj["id"].toInt();   // don't spam the log with image data
+    else
+        qCDebug(KSTARS_EKOS_GUIDE) << "PHD2: response:" << line;
 
     switch (resultType)
     {
@@ -495,7 +529,6 @@ void PHD2::processPHD2Result(const QJsonObject &jsonObj, const QByteArray& rawRe
             break;
 
         case DITHER_COMMAND_RECEIVED:               //dither
-            state = DITHERING;
             emit newStatus(Ekos::GUIDE_DITHERING);
             break;
 
@@ -562,7 +595,7 @@ void PHD2::processPHD2Result(const QJsonObject &jsonObj, const QByteArray& rawRe
 
         case PIXEL_SCALE:                           //get_pixel_scale
             pixelScale=jsonObj["result"].toDouble();
-            if(pixelScale == 0 )
+            if (pixelScale == 0)
                 emit newLog(i18n("PHD2: Please set CCD and telescope parameters in PHD2, Pixel Scale is invalid."));
             else
                 emit newLog(i18n("PHD2: Pixel Scale is %1 arcsec per pixel", QString::number(pixelScale, 'f', 2)));
@@ -616,10 +649,15 @@ void PHD2::processPHD2Result(const QJsonObject &jsonObj, const QByteArray& rawRe
         case STOP_CAPTURE_COMMAND_RECEIVED:         //stop_capture
             break;
     }
+
+    // send the next pending call
+    sendNextRpcCall();
 }
 
-void PHD2::processPHD2Error(const QJsonObject &jsonError)
+void PHD2::processPHD2Error(const QJsonObject &jsonError, const QByteArray &line)
 {
+    qCDebug(KSTARS_EKOS_GUIDE) << "PHD2: error:" << line;
+
     QJsonObject jsonErrorObject = jsonError["error"].toObject();
 
     emit newLog(i18n("PHD2 Error: %1", jsonErrorObject["message"].toString()));
@@ -637,22 +675,31 @@ void PHD2::processPHD2Error(const QJsonObject &jsonError)
         connection = EQUIPMENT_DISCONNECTED;
         emit newStatus(Ekos::GUIDE_DISCONNECTED);
     }
-    else if (resultType == DITHER_COMMAND_RECEIVED && state == DITHERING)
+    else if (resultType == DITHER_COMMAND_RECEIVED)
     {
         ditherTimer->stop();
-        state = DITHER_FAILED;
+        isSettling = false;
+        isDitherActive = false;
         emit newStatus(GUIDE_DITHERING_ERROR);
 
         if (Options::ditherFailAbortsAutoGuide())
         {
-            state = STOPPED;
+            abort();
             emit newStatus(GUIDE_ABORTED);
         }
         else
         {
+            // !FIXME-ag why is this trying to resume (un-pause)?
             resume();
         }
     }
+    else if (resultType == GUIDE_COMMAND_RECEIVED)
+    {
+        isSettling = false;
+    }
+
+    // send the next pending call
+    sendNextRpcCall();
 }
 
 //These methods process the Star Images the PHD2 provides
@@ -738,6 +785,7 @@ void PHD2::processStarImage(const QJsonObject &jsonStarFrame)
    bool imageLoad = guideFrame->loadFITS(filename, true);
    if (imageLoad)
    {
+       guideFrame->getImageData()->setAutoRemoveTemporaryFITS(false); // we'll take care of deleting the temp file
        guideFrame->updateFrame();
        guideFrame->setTrackingBox(QRect(0,0,width,height));
        emit newStarPixmap(guideFrame->getTrackingBoxPixmap());
@@ -752,22 +800,17 @@ void PHD2::setEquipmentConnected()
         connection = EQUIPMENT_CONNECTED;
         emit newStatus(Ekos::GUIDE_CONNECTED);
         updateGuideParameters();
-        QTimer::singleShot(800, [=]{requestExposureDurations();});
+        requestExposureDurations();
     }
 }
 
 void PHD2::updateGuideParameters()
 {
-    if(pixelScale == 0)
+    if (pixelScale == 0)
         requestPixelScale();
-    //So that the commands aren't too quick for PHD2, a slight delay before asking for the other items.
-    QTimer::singleShot(100, [=]{requestExposureTime();});
-    QTimer::singleShot(400, [=]{checkDEGuideMode();});
+    requestExposureTime();
+    checkDEGuideMode();
 }
-
-
-
-
 
 //This section handles the methods/requests sent to PHD2, some are not implemented.
 
@@ -799,12 +842,27 @@ bool PHD2::dither(double pixels)
         return false;
     }
 
+    if (isSettling)
+    {
+        qCDebug(KSTARS_EKOS_GUIDE) << "PHD2: ignoring dither requested while already settling";
+        if (!isDitherActive)
+        {
+            // act like we just dithered so we get the appropriate
+            // effects after the settling completes
+            emit newStatus(Ekos::GUIDE_DITHERING);
+            isDitherActive = true;
+        }
+        return true;
+    }
+
     QJsonArray args;
     QJsonObject settle;
 
+    int ditherTimeout = static_cast<int>(Options::ditherTimeout());
+
     settle.insert("pixels", static_cast<double>(Options::ditherThreshold()));
     settle.insert("time", static_cast<int>(Options::ditherSettle()));
-    settle.insert("timeout", static_cast<int>(Options::ditherTimeout()));
+    settle.insert("timeout", ditherTimeout);
 
     // Pixels
     args << pixels;
@@ -813,10 +871,22 @@ bool PHD2::dither(double pixels)
     // Settle
     args << settle;
 
-    state = DITHERING;
-    ditherTimer->start(static_cast<int>(Options::ditherTimeout())*1000); //Timer is in ms, timeout is in sec
+    isSettling = true;
+    isDitherActive = true;
+
+    // PHD2 will send a SettleDone event shortly after the settling
+    // timeout in PHD2. We don't really need a timer here, but we'll
+    // set one anyway (belt and suspenders). Make sure to give an
+    // extra time allowance since PHD2 won't report its timeout until
+    // the completion of the next guide exposure after the timeout
+    // period expires.
+    enum { TIMEOUT_EXTRA_SECONDS = 60 };  // at least as long as any reasonable guide exposure
+    int millis = (ditherTimeout + TIMEOUT_EXTRA_SECONDS) * 1000;
+    ditherTimer->start(millis);
 
     sendPHD2Request("dither", args);
+
+    emit newStatus(Ekos::GUIDE_DITHERING);
 
     return true;
 }
@@ -832,29 +902,28 @@ bool PHD2::dither(double pixels)
 //get_connected
 void PHD2::checkIfEquipmentConnected()
 {
-    QJsonArray args;
-    sendPHD2Request("get_connected", args);
+    sendPHD2Request("get_connected");
 }
 
 //get_cooler_status
 //get_current_equipment
 
 //get_dec_guide_mode
-void PHD2::checkDEGuideMode(){
-    QJsonArray args;
-    sendPHD2Request("get_dec_guide_mode", args);
+void PHD2::checkDEGuideMode()
+{
+    sendPHD2Request("get_dec_guide_mode");
 }
 
 //get_exposure
-void PHD2::requestExposureTime(){
-    QJsonArray args;
-    sendPHD2Request("get_exposure", args);
+void PHD2::requestExposureTime()
+{
+    sendPHD2Request("get_exposure");
 }
 
 //get_exposure_durations
-void PHD2::requestExposureDurations(){
-    QJsonArray args;
-    sendPHD2Request("get_exposure_durations", args);
+void PHD2::requestExposureDurations()
+{
+    sendPHD2Request("get_exposure_durations");
 }
 
 //get_lock_position
@@ -863,9 +932,9 @@ void PHD2::requestExposureDurations(){
 //get_paused
 
 //get_pixel_scale
-void PHD2::requestPixelScale(){
-    QJsonArray args;
-    sendPHD2Request("get_pixel_scale", args);
+void PHD2::requestPixelScale()
+{
+    sendPHD2Request("get_pixel_scale");
 }
 
 //get_profile
@@ -874,9 +943,10 @@ void PHD2::requestPixelScale(){
 //get_sensor_temperature
 
 //get_star_image
-void PHD2::requestStarImage(int size){
+void PHD2::requestStarImage(int size)
+{
     QJsonArray args2;
-    args2<<size; //This is both the width and height.
+    args2 << size; //This is both the width and height.
     sendPHD2Request("get_star_image", args2); //Note we don't want to add it to the request list since this request type is handled before the list is checked.
 }
 
@@ -912,6 +982,8 @@ bool PHD2::guide()
 
     errorLog.clear();
 
+    isSettling = true;
+
     sendPHD2Request("guide", args);
 
     return true;
@@ -944,17 +1016,17 @@ void PHD2::connectEquipment(bool enable)
     // connected = enable
     args << enable;
 
-    if(enable)
+    if (enable)
         emit newLog(i18n("PHD2: Connecting Equipment. . ."));
     else
         emit newLog(i18n("PHD2: Disconnecting Equipment. . ."));
 
     sendPHD2Request("set_connected", args);
-
 }
 
 //set_dec_guide_mode
-void PHD2::requestSetDEGuideMode(bool deEnabled, bool nEnabled, bool sEnabled){ //Possible Settings Off, Auto, North, and South
+void PHD2::requestSetDEGuideMode(bool deEnabled, bool nEnabled, bool sEnabled) //Possible Settings Off, Auto, North, and South
+{
     QJsonArray args;
 
     if(deEnabled)
@@ -972,16 +1044,16 @@ void PHD2::requestSetDEGuideMode(bool deEnabled, bool nEnabled, bool sEnabled){ 
     {
         args << "Off";
     }
-    sendPHD2Request("set_dec_guide_mode", args);
 
+    sendPHD2Request("set_dec_guide_mode", args);
 }
 
 //set_exposure
-void PHD2::requestSetExposureTime(int time){ //Note: time is in milliseconds
+void PHD2::requestSetExposureTime(int time) //Note: time is in milliseconds
+{
     QJsonArray args;
-    args<<time;
+    args << time;
     sendPHD2Request("set_exposure", args);
-
 }
 
 //set_lock_position
@@ -1046,9 +1118,6 @@ bool PHD2::abort()
     return true;
 }
 
-
-
-
 //This method is not handled by PHD2
 bool PHD2::calibrate()
 {
@@ -1057,66 +1126,95 @@ bool PHD2::calibrate()
     return true;
 }
 
-
-
-
-
-
 //This is how information requests and commands for PHD2 are handled
+
+void PHD2::sendRpcCall(QJsonObject &call, PHD2ResultType resultType)
+{
+    assert(resultType != NO_RESULT); // should be a real request
+    assert(pendingRpcResultType == NO_RESULT);  // only one pending RPC call at a time
+
+    int rpcId = nextRpcId++;
+    call.insert("id", rpcId);
+
+    pendingRpcId = rpcId;
+    pendingRpcResultType = resultType;
+
+    QByteArray request = QJsonDocument(call).toJson(QJsonDocument::Compact);
+
+    qCDebug(KSTARS_EKOS_GUIDE) << "PHD2: request:" << request;
+
+    request.append("\r\n");
+    qint64 n = tcpSocket->write(request);
+
+    if ((int) n != request.size())
+    {
+        qCDebug(KSTARS_EKOS_GUIDE) << "PHD2: unexpected short write:" << n << "bytes of" << request.size();
+    }
+}
+
+void PHD2::sendNextRpcCall()
+{
+    if (pendingRpcResultType != NO_RESULT)
+        return; // a request is currently outstanding
+
+    if (rpcRequestQueue.empty())
+        return; // no queued requests
+
+    RpcCall& call = rpcRequestQueue.front();
+    sendRpcCall(call.call, call.resultType);
+    rpcRequestQueue.pop_front();
+}
 
 void PHD2::sendPHD2Request(const QString &method, const QJsonArray &args)
 {
     assert(methodResults.contains(method));
+
+    PHD2ResultType resultType = methodResults[method];
 
     QJsonObject jsonRPC;
 
     jsonRPC.insert("jsonrpc", "2.0");
     jsonRPC.insert("method", method);
 
-    if (args.empty() == false)
+    if (!args.empty())
         jsonRPC.insert("params", args);
 
-    int rpcId = nextRpcId++;
-    resultRequests.append(qMakePair(rpcId, methodResults.value(method)));
-    jsonRPC.insert("id", rpcId);
+    if (pendingRpcResultType == NO_RESULT)
+    {
+        // no outstanding rpc call, send it right off
+        sendRpcCall(jsonRPC, resultType);
+    }
+    else
+    {
+        // there is already an oustanding call, enqueue this call
+        // until the prior call completes
 
-    QJsonDocument json_doc(jsonRPC);
+        qCDebug(KSTARS_EKOS_GUIDE) << "PHD2: defer call" << method;
 
-    //emit newLog(json_doc.toJson(QJsonDocument::Compact));
-    qCDebug(KSTARS_EKOS_GUIDE) << json_doc.toJson(QJsonDocument::Compact);
-
-    tcpSocket->write(json_doc.toJson(QJsonDocument::Compact));
-    tcpSocket->write("\r\n");
-}
-
-// Compare two rpc ids returning true if id1 is older than id2, false
-// otherwise, properly handling wrap-around of signed integers
-inline static bool RpcIdIsOlder(int id1, int id2)
-{
-    return (int) ((unsigned int) id1 - (unsigned int) id2) < 0;
+        rpcRequestQueue.push_back(RpcCall(jsonRPC, resultType));
+    }
 }
 
 PHD2::PHD2ResultType PHD2::takeRequestFromList(const QJsonObject &response)
 {
-    if (!response.contains("id"))
+    if (Q_UNLIKELY(!response.contains("id")))
+    {
+        qCDebug(KSTARS_EKOS_GUIDE) << "PHD2: ignoring unexpected response with no id";
         return NO_RESULT;
+    }
 
     int id = response["id"].toInt();
 
-    // phd2's responses are guaranteed to come in order so entries
-    // with older ids are stale and can be removed
-
-    while (!resultRequests.isEmpty() && RpcIdIsOlder(resultRequests.at(0).first, id))
+    if (Q_UNLIKELY(id != pendingRpcId))
     {
-        qCDebug(KSTARS_EKOS_GUIDE) << "PHD2: removing stale rpc id " << resultRequests.at(0).first;
-        resultRequests.remove(0);
+        // RPC id mismatch -- this should never happen, something is
+        // seriously wrong
+        qCDebug(KSTARS_EKOS_GUIDE) << "PHD2: ignoring unexpected response with id" << id;
+        return NO_RESULT;
     }
 
-    if (resultRequests.isEmpty() || resultRequests.at(0).first != id)
-        return NO_RESULT;
-
-    PHD2::PHD2ResultType val = resultRequests.at(0).second;
-    resultRequests.remove(0);
+    PHD2ResultType val = pendingRpcResultType;
+    pendingRpcResultType = NO_RESULT;
     return val;
 }
 
