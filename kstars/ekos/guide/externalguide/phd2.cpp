@@ -161,6 +161,7 @@ void PHD2::ResetConnectionState()
     pendingRpcResultType = NO_RESULT;
     rpcRequestQueue.clear();
 
+    starImageRequested = false;
     isSettling = false;
     isDitherActive = false;
 
@@ -608,11 +609,9 @@ void PHD2::processPHD2Result(const QJsonObject &jsonObj, const QByteArray &line)
 
         case STAR_IMAGE:                            //get_star_image
         {
+            starImageRequested = false;
             QJsonObject jsonResult = jsonObj["result"].toObject();
-            if (jsonResult.contains("frame"))
-            {
-                processStarImage(jsonResult);
-            }
+            processStarImage(jsonResult);
             break;
         }
 
@@ -782,8 +781,8 @@ void PHD2::processStarImage(const QJsonObject &jsonStarFrame)
 
    //This loads the FITS file in the Guide FITSView
    //Then it updates the Summary Screen
-   bool imageLoad = guideFrame->loadFITS(filename, true);
-   if (imageLoad)
+   bool imageLoaded = guideFrame->loadFITS(filename, true);
+   if (imageLoaded)
    {
        guideFrame->getImageData()->setAutoRemoveTemporaryFITS(false); // we'll take care of deleting the temp file
        guideFrame->updateFrame();
@@ -945,9 +944,17 @@ void PHD2::requestPixelScale()
 //get_star_image
 void PHD2::requestStarImage(int size)
 {
+    if (starImageRequested)
+    {
+        qCDebug(KSTARS_EKOS_GUIDE) << "PHD2: skip extra star image request";
+        return;
+    }
+
     QJsonArray args2;
-    args2 << size; //This is both the width and height.
-    sendPHD2Request("get_star_image", args2); //Note we don't want to add it to the request list since this request type is handled before the list is checked.
+    args2 << size; // This is both the width and height.
+    sendPHD2Request("get_star_image", args2);
+
+    starImageRequested = true;
 }
 
 //get_use_subframes

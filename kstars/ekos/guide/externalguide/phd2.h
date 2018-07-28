@@ -216,6 +216,7 @@ class PHD2 : public GuideInterface
 
     int pendingRpcId;                         // ID of outstanding RPC call
     PHD2ResultType pendingRpcResultType { NO_RESULT };      // result type of outstanding RPC call
+    bool starImageRequested { false };        // true when there is an outstanding star image request
 
     struct RpcCall
     {
