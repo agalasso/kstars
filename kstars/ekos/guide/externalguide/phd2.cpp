@@ -250,7 +250,8 @@ void PHD2::readPHD2()
 
 void PHD2::processPHD2Event(const QJsonObject &jsonEvent, const QByteArray &line)
 {
-    qCDebug(KSTARS_EKOS_GUIDE) << "PHD2: event:" << line;
+    if (Options::verboseLogging())
+        qCDebug(KSTARS_EKOS_GUIDE) << "PHD2: event:" << line;
 
     QString eventName = jsonEvent["Event"].toString();
 
@@ -844,6 +845,7 @@ bool PHD2::dither(double pixels)
     if (isSettling)
     {
         qCDebug(KSTARS_EKOS_GUIDE) << "PHD2: ignoring dither requested while already settling";
+
         if (!isDitherActive)
         {
             // act like we just dithered so we get the appropriate
@@ -944,9 +946,13 @@ void PHD2::requestPixelScale()
 //get_star_image
 void PHD2::requestStarImage(int size)
 {
+    if (!Options::guideRemoteImagesEnabled())
+        return;
+
     if (starImageRequested)
     {
-        qCDebug(KSTARS_EKOS_GUIDE) << "PHD2: skip extra star image request";
+        if (Options::verboseLogging())
+            qCDebug(KSTARS_EKOS_GUIDE) << "PHD2: skip extra star image request";
         return;
     }
 
@@ -1196,7 +1202,8 @@ void PHD2::sendPHD2Request(const QString &method, const QJsonArray &args)
         // there is already an oustanding call, enqueue this call
         // until the prior call completes
 
-        qCDebug(KSTARS_EKOS_GUIDE) << "PHD2: defer call" << method;
+        if (Options::verboseLogging())
+            qCDebug(KSTARS_EKOS_GUIDE) << "PHD2: defer call" << method;
 
         rpcRequestQueue.push_back(RpcCall(jsonRPC, resultType));
     }
